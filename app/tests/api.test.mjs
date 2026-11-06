@@ -1,0 +1,27 @@
+import {test,before,after} from 'node:test';import assert from 'node:assert/strict';import {spawn} from 'node:child_process';import {mkdtemp,rm} from 'node:fs/promises';import {tmpdir} from 'node:os';import {join} from 'node:path';import sharp from 'sharp';
+let server,dir,cookie='',project;const port=19431,base=`http://127.0.0.1:${port}`;
+async function req(url,method='GET',body,auth=true){const r=await fetch(base+url,{method,headers:{...(auth&&cookie?{cookie}:{}),...(body?{'content-type':'application/json'}:{})},body:body?JSON.stringify(body):undefined});return {status:r.status,body:await r.json(),cookie:r.headers.get('set-cookie')};}
+before(async()=>{dir=await mkdtemp(join(tmpdir(),'garden-test-'));server=spawn(process.execPath,['server/index.mjs','--production'],{cwd:process.cwd(),env:{...process.env,PORT:String(port),DATA_DIR:dir,ADMIN_PASSWORD:'test-password-123'},stdio:['ignore','pipe','pipe']});await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(new Error('server timeout')),15000);server.stdout.on('data',d=>{if(d.toString().includes('ready:')){clearTimeout(timer);resolve();}});server.on('exit',()=>{clearTimeout(timer);reject(new Error('server exited'));});});});
+after(async()=>{server?.kill();await new Promise(r=>server?.once('exit',r));await rm(dir,{recursive:true,force:true});});
+test('authorization, draft isolation, preview, immutable photos, publish, access and revoke',async()=>{
+ assert.equal((await req('/api/projects','GET',undefined,false)).status,401);
+ const login=await req('/api/login','POST',{password:'test-password-123'},false);assert.equal(login.status,200);cookie=login.cookie.split(';')[0];
+ const list=await req('/api/projects');project=list.body[0];assert.equal(project.content.demo,true);
+ const created=await req('/api/projects','POST',{});assert.equal(created.body.content.names[0],'');assert.deepEqual(created.body.content.photos,[]);assert.notEqual(created.body.slug,project.slug);
+ const content={...project.content,names:['测试新人甲','测试新人乙']};let saved=await req(`/api/projects/${project.id}`,'PUT',{content,revision:project.revision,expires:project.expires});assert.equal(saved.status,200);project=saved.body;
+ const publicOld=await req(`/api/invitations/${project.slug}`,'GET',undefined,false);assert.notDeepEqual(publicOld.body.content.names,content.names);
+ const conflict=await req(`/api/projects/${project.id}`,'PUT',{content,revision:1,expires:project.expires});assert.equal(conflict.status,409);
+ assert.equal((await req(`/api/projects/${project.id}/publish`,'POST',{})).status,400);
+ const image=await sharp({create:{width:100,height:150,channels:3,background:'#abc'}}).png().toBuffer();const form=new FormData();form.append('photo',new Blob([image]),'test.png');const uploaded=await fetch(base+`/api/projects/${project.id}/photos`,{method:'POST',headers:{cookie},body:form});const ph=await uploaded.json();assert.equal(uploaded.status,200);assert.equal((await fetch(base+`/api/media/${ph.id}`)).status,404);
+ const cropped=await req(`/api/projects/${project.id}/photos/${ph.id}/crop`,'POST',{x:0,y:0,width:1,height:.8,rotation:90});assert.notEqual(cropped.body.id,ph.id);
+ content.photos=[{id:cropped.body.id,caption:'测试'}];saved=await req(`/api/projects/${project.id}`,'PUT',{content,revision:project.revision,expires:project.expires,accessCode:'secret12'});project=saved.body;
+ const preview=await req(`/api/projects/${project.id}/preview`,'POST',{});const token=preview.body.url.split('/').pop();const snap=await req(`/api/preview/${token}`,'GET',undefined,false);assert.equal(snap.body.content.names[0],'测试新人甲');
+ await req(`/api/projects/${project.id}/review`,'POST',{revision:project.revision});const published=await req(`/api/projects/${project.id}/publish`,'POST',{});assert.equal(published.status,200);
+ assert.equal((await req(`/api/invitations/${project.slug}`,'GET',undefined,false)).status,401);
+ const unlocked=await req(`/api/invitations/${project.slug}/access`,'POST',{code:'secret12'},false);assert.equal(unlocked.status,200);const guest=unlocked.cookie.split(';')[0];const visible=await fetch(base+`/api/invitations/${project.slug}`,{headers:{cookie:guest}});assert.equal(visible.status,200);
+ const second=created.body;const secondSaved=await req(`/api/projects/${second.id}`,'PUT',{content:{...content,photos:[]},revision:second.revision,expires:second.expires,accessCode:'other123'});await req(`/api/projects/${second.id}/review`,'POST',{revision:secondSaved.body.revision});await req(`/api/projects/${second.id}/publish`,'POST',{});const stolenScope=guest.replace(`guest_${project.id}`,`guest_${second.id}`);assert.equal((await fetch(base+`/api/invitations/${second.slug}`,{headers:{cookie:stolenScope}})).status,401);
+ const media=await fetch(base+`/api/media/${cropped.body.id}`,{headers:{cookie:guest}});assert.equal(media.status,200);
+ const calendar=await fetch(base+`/api/invitations/${project.slug}/calendar`,{headers:{cookie:guest}});assert.match(await calendar.text(),/BEGIN:VCALENDAR/);
+ const cover=await fetch(base+`/api/invitations/${project.slug}/cover`);assert.equal(cover.headers.get('content-type'),'image/png');assert.ok((await cover.arrayBuffer()).byteLength>10000);
+ await req(`/api/projects/${project.id}/revoke`,'POST',{});assert.equal((await req(`/api/invitations/${project.slug}`,'GET',undefined,false)).status,404);assert.equal((await fetch(base+`/api/media/${cropped.body.id}`,{headers:{cookie:guest}})).status,404);assert.equal((await req(`/api/preview/${token}`,'GET',undefined,false)).status,404);
+});
